@@ -309,7 +309,7 @@ pub mod tests {
     use crate::metrics::NoOpMetricsCollector;
     use crate::pbold;
     use crate::scalar::bitmap::BitmapIndexPlugin;
-    use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
+    use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters, DEFAULT_RANGE_PARTITIONED};
     use crate::scalar::label_list::LabelListIndexPlugin;
     use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
@@ -356,6 +356,7 @@ pub mod tests {
         let batch_size = custom_batch_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
         let params = BTreeParameters {
             zone_size: Some(batch_size),
+            ..Default::default()
         };
         let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;
@@ -865,6 +866,8 @@ pub mod tests {
             &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            DEFAULT_RANGE_PARTITIONED,
             None,
         )
         .await

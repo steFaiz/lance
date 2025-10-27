@@ -1,21 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use futures::future::BoxFuture;
-use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
-use lance_table::format::IndexMetadata;
-use snafu::location;
-use std::{future::IntoFuture, sync::Arc};
-use tracing::instrument;
-use uuid::Uuid;
-
 use crate::{
     dataset::{
         transaction::{Operation, Transaction},
         Dataset,
     },
     index::{
-        scalar::build_scalar_index,
+        scalar::{build_scalar_index, write_scalar_index},
         vector::{
             build_empty_vector_index, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
         },
@@ -23,10 +15,22 @@ use crate::{
     },
     Error, Result,
 };
+use datafusion::error::DataFusionError;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use futures::StreamExt;
+use futures::{future::BoxFuture, stream};
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
 };
+use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
+use lance_table::format::IndexMetadata;
+use snafu::location;
+use std::{future::IntoFuture, sync::Arc};
+use tracing::instrument;
+use uuid::Uuid;
+
+use arrow_array::RecordBatchReader;
 
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
@@ -313,6 +317,142 @@ impl<'a> CreateIndexBuilder<'a> {
                 return Err(Error::Index {
                     message: format!(
                         "Index type {index_type} with name {index_name} is not supported"
+                    ),
+                    location: location!(),
+                });
+            }
+        };
+
+        Ok(IndexMetadata {
+            uuid: index_id,
+            name: index_name,
+            fields: vec![field.id],
+            dataset_version: self.dataset.manifest.version,
+            fragment_bitmap: if train {
+                match &self.fragments {
+                    Some(fragment_ids) => Some(fragment_ids.iter().collect()),
+                    None => Some(
+                        self.dataset
+                            .get_fragments()
+                            .iter()
+                            .map(|f| f.id() as u32)
+                            .collect(),
+                    ),
+                }
+            } else {
+                // Empty bitmap for untrained indices
+                Some(roaring::RoaringBitmap::new())
+            },
+            index_details: Some(Arc::new(created_index.index_details)),
+            index_version: created_index.index_version as i32,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+        })
+    }
+
+    #[instrument(skip_all)]
+    pub async fn write_uncommitted(
+        &mut self,
+        sorted_stream: impl RecordBatchReader + Send + 'static,
+    ) -> Result<IndexMetadata> {
+        if self.columns.len() != 1 {
+            return Err(Error::Index {
+                message: "Only support building index on 1 column at the moment".to_string(),
+                location: location!(),
+            });
+        }
+        let column = &self.columns[0];
+        let Some(field) = self.dataset.schema().field(column) else {
+            return Err(Error::Index {
+                message: format!("CreateIndex: column '{column}' does not exist"),
+                location: location!(),
+            });
+        };
+
+        // If train is true but dataset is empty, automatically set train to false
+        let train = if self.train {
+            self.dataset.count_rows(None).await? > 0
+        } else {
+            false
+        };
+
+        // Load indices from the disk.
+        let indices = self.dataset.load_indices().await?;
+        let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
+        if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
+            if idx.fields == [field.id] && !self.replace {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index name '{index_name} already exists, \
+                        please specify a different name or use replace=True"
+                    ),
+                    location: location!(),
+                });
+            };
+            if idx.fields != [field.id] {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index name '{index_name} already exists with different fields, \
+                        please specify a different name"
+                    ),
+                    location: location!(),
+                });
+            }
+        }
+
+        let index_id = match &self.fragment_uuid {
+            Some(uuid_str) => Uuid::parse_str(uuid_str).map_err(|e| Error::Index {
+                message: format!("Invalid UUID string provided: {}", e),
+                location: location!(),
+            })?,
+            None => Uuid::new_v4(),
+        };
+        let created_index = match (self.index_type, self.params.index_name()) {
+            (IndexType::Bitmap, LANCE_SCALAR_INDEX) => {
+                let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
+
+                // If custom params were provided, extract the params JSON and apply it
+                let params = if let Some(provided_params) =
+                    self.params.as_any().downcast_ref::<ScalarIndexParams>()
+                {
+                    if let Some(params_json) = &provided_params.params {
+                        // Parse and apply the custom parameters
+                        if let Ok(json_value) =
+                            serde_json::from_str::<serde_json::Value>(params_json)
+                        {
+                            base_params.with_params(&json_value)
+                        } else {
+                            base_params
+                        }
+                    } else {
+                        base_params
+                    }
+                } else {
+                    base_params
+                };
+
+                let training_data = Box::pin(RecordBatchStreamAdapter::new(
+                    sorted_stream.schema(),
+                    stream::iter(sorted_stream).map(|result| {
+                        // convert from Result<RecordBatch, ArrowError> to Result<RecordBatch, DataFusionError>
+                        result.map_err(DataFusionError::from)
+                    }),
+                ));
+
+                write_scalar_index(
+                    self.dataset,
+                    training_data,
+                    column,
+                    &index_id.to_string(),
+                    &params,
+                    None,
+                )
+                .await?
+            }
+            (index_type, index_name) => {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index type {index_type} with name {index_name} is not supported for write_uncommitted"
                     ),
                     location: location!(),
                 });

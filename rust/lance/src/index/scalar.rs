@@ -15,6 +15,7 @@ use crate::{
 use arrow_schema::DataType;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion_physical_plan::RecordBatchStream;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_core::datatypes::Field;
@@ -150,7 +151,7 @@ pub(crate) async fn scan_training_data(
         scan.with_fragments(fragments);
     }
 
-    let batches = scan
+    let batches: std::pin::Pin<Box<dyn RecordBatchStream + Send>> = scan
         .try_into_dfstream(LanceExecutionOptions {
             use_spilling,
             ..Default::default()
@@ -295,6 +296,33 @@ pub(super) async fn build_scalar_index(
         fragment_ids.clone(),
     )
     .await?;
+
+    plugin
+        .train_index(training_data, &index_store, training_request, fragment_ids)
+        .await
+}
+
+/// Build a Scalar Index (returns details to store in the manifest)
+#[instrument(level = "debug", skip_all)]
+pub(super) async fn write_scalar_index(
+    dataset: &Dataset,
+    training_data: SendableRecordBatchStream,
+    column: &str,
+    uuid: &str,
+    params: &ScalarIndexParams,
+    fragment_ids: Option<Vec<u32>>,
+) -> Result<CreatedIndex> {
+    let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
+        source: format!("No column with name {}", column).into(),
+        location: location!(),
+    })?;
+    let field: arrow_schema::Field = field.into();
+
+    let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
+
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let training_request =
+        plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
     plugin
         .train_index(training_data, &index_store, training_request, fragment_ids)
