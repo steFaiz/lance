@@ -67,12 +67,9 @@ const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
-<<<<<<< HEAD
-=======
 pub const DEFAULT_RANGE_PARTITIONED: bool = false;
 const RANGE_PARTITIONED_META_KEY: &str = "range_partitioned";
 const PAGE_NUM_PER_RANGE_PARTITION_META_KEY: &str = "page_num_per_range_partition";
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
 const BTREE_INDEX_VERSION: u32 = 0;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
@@ -1247,11 +1244,8 @@ impl ScalarIndex for BTreeIndex {
             self.sub_index.as_ref(),
             dest_store,
             DEFAULT_BTREE_BATCH_SIZE,
-<<<<<<< HEAD
-=======
             None,
             DEFAULT_RANGE_PARTITIONED,
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
             None,
         )
         .await?;
@@ -1270,11 +1264,8 @@ impl ScalarIndex for BTreeIndex {
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         let params = serde_json::to_value(BTreeParameters {
             zone_size: Some(self.batch_size),
-<<<<<<< HEAD
-=======
             range_partitioned: self.range_partitioned,
             range_id: None,
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
     }
@@ -1606,15 +1597,12 @@ async fn merge_metadata_files(
         .get(BATCH_SIZE_META_KEY)
         .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
         .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
-<<<<<<< HEAD
-=======
     let range_partitioned = first_lookup_reader
         .schema()
         .metadata
         .get(RANGE_PARTITIONED_META_KEY)
         .map(|bs| bs.parse().unwrap_or(DEFAULT_RANGE_PARTITIONED))
         .unwrap_or(DEFAULT_RANGE_PARTITIONED);
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
 
     // Get the value type from lookup schema (min column)
     let value_type = first_lookup_reader
@@ -1624,37 +1612,6 @@ async fn merge_metadata_files(
         .unwrap()
         .data_type();
 
-<<<<<<< HEAD
-    // Get page schema first
-    let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
-    let page_file = page_files_map.get(&partition_id).unwrap();
-    let page_reader = store.open_index_file(page_file).await?;
-    let page_schema = page_reader.schema().clone();
-
-    let arrow_schema = Arc::new(Schema::from(&page_schema));
-    let mut page_file = store
-        .new_index_file(BTREE_PAGES_NAME, arrow_schema.clone())
-        .await?;
-
-    // Step 4: Merge pages and create lookup entries
-    let lookup_entries = merge_pages(
-        part_lookup_files,
-        &page_files_map,
-        &store,
-        batch_size,
-        &mut page_file,
-        arrow_schema.clone(),
-        batch_readhead,
-    )
-    .await?;
-
-    page_file.finish().await?;
-
-    // Step 5: Generate new lookup file based on reorganized pages
-    // Add batch_size to schema metadata
-    let mut metadata = HashMap::new();
-    metadata.insert(BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
-=======
     // Step 5: Generate new lookup file based on reorganized pages
     // Add batch_size to schema metadata
     // TODO: set metadata info
@@ -1728,7 +1685,6 @@ async fn merge_metadata_files(
         )
         .await?;
         page_file.finish().await?;
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
 
         let lookup_batch = RecordBatch::try_new(
             lookup_schema.clone(),
@@ -1887,8 +1843,6 @@ async fn merge_pages(
     Ok(lookup_entries)
 }
 
-<<<<<<< HEAD
-=======
 // Sorts file paths by the partition ID extracted from their names.
 fn sort_files_by_partition_id(part_files: &[String]) -> Result<Vec<String>> {
     let mut files_with_ids: Vec<(u64, &String)> = part_files
@@ -1906,7 +1860,6 @@ fn sort_files_by_partition_id(part_files: &[String]) -> Result<Vec<String>> {
     Ok(sorted_files)
 }
 
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
 /// Extract partition ID from partition file name
 /// Expected format: "part_{partition_id}_{suffix}.lance"
 fn extract_partition_id(filename: &str) -> Result<u64> {
@@ -2059,8 +2012,6 @@ impl Stream for IndexReaderStream {
 pub struct BTreeParameters {
     /// The number of rows to include in each zone
     pub zone_size: Option<u64>,
-<<<<<<< HEAD
-=======
 
     /// If true, the index is built with range partitioning, creating multiple
     /// independent sub-indices. This is designed for distributed index building,
@@ -2079,7 +2030,6 @@ pub struct BTreeParameters {
     /// less than or equal to all data in the partition with `range_id: 1`.
     /// The caller is responsible for ensuring this ordering when providing data for training.
     pub range_id: Option<u32>,
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
 }
 
 struct BTreeTrainingRequest {
@@ -2215,10 +2165,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
 
     use crate::metrics::LocalMetricsCollector;
-<<<<<<< HEAD
-=======
     use crate::scalar::btree::{BTREE_LOOKUP_NAME, DEFAULT_RANGE_PARTITIONED};
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
@@ -2268,11 +2215,6 @@ mod tests {
             .into_df_stream(RowCount::from(5000), BatchCount::from(10));
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-<<<<<<< HEAD
-        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 5000, None)
-            .await
-            .unwrap();
-=======
         train_btree_index(
             stream,
             &sub_index_trainer,
@@ -2284,7 +2226,6 @@ mod tests {
         )
         .await
         .unwrap();
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
 
         let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
@@ -2365,11 +2306,6 @@ mod tests {
 
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float64);
 
-<<<<<<< HEAD
-        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64, None)
-            .await
-            .unwrap();
-=======
         train_btree_index(
             stream,
             &sub_index_trainer,
@@ -2381,7 +2317,6 @@ mod tests {
         )
         .await
         .unwrap();
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
 
         let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
             .await
@@ -2420,11 +2355,6 @@ mod tests {
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-<<<<<<< HEAD
-        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64, None)
-            .await
-            .unwrap();
-=======
         train_btree_index(
             stream,
             &sub_index_trainer,
@@ -2436,7 +2366,6 @@ mod tests {
         )
         .await
         .unwrap();
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
 
         let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
         let index = BTreeIndex::load(test_store, None, cache.as_ref())
@@ -2487,11 +2416,8 @@ mod tests {
             &sub_index_trainer,
             full_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-<<<<<<< HEAD
-=======
             None,
             DEFAULT_RANGE_PARTITIONED,
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
             None,
         )
         .await
@@ -2681,11 +2607,8 @@ mod tests {
             &sub_index_trainer,
             full_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-<<<<<<< HEAD
-=======
             None,
             DEFAULT_RANGE_PARTITIONED,
->>>>>>> 7b57d3f4 (PullRequest: 25 implement of range build)
             None,
         )
         .await
