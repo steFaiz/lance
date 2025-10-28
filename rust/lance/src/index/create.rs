@@ -93,6 +93,7 @@ impl<'a> CreateIndexBuilder<'a> {
         stream: Box<dyn RecordBatchReader + Send + 'static>,
     ) -> Self {
         self.preprocessed_data = Some(stream);
+        self
     }
 
     #[instrument(skip_all)]

@@ -791,6 +791,7 @@ mod tests {
 
         let btree_params = BTreeParameters {
             zone_size: Some(50),
+            range_id: None,
         };
         let params_json = serde_json::to_value(&btree_params).unwrap();
         let index_params =

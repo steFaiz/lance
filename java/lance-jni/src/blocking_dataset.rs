@@ -778,8 +778,8 @@ fn inner_create_index(
         index_builder = index_builder.index_uuid(index_uuid);
     }
 
-    if let Some(reader) = batch_reader {
-        index_builder = index_builder.preprocessed_data(Box::new(reader));
+    if has_fragment_ids {
+        RT.block_on(index_builder.execute_uncommitted())?;
     } else {
         RT.block_on(index_builder.into_future())?
     }
