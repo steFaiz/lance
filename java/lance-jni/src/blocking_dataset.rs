@@ -726,7 +726,36 @@ fn inner_create_index(
     let params = params_result?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.create_index(&columns_slice, index_type, name, params.as_ref(), replace)?;
+
+    let mut index_builder = dataset_guard
+        .inner
+        .create_index_builder(&columns_slice, index_type, params.as_ref())
+        .replace(replace)
+        .train(train);
+
+    if let Some(name) = name {
+        index_builder = index_builder.name(name);
+    }
+
+    skip_commit = skip_commit || fragment_ids.is_some();
+
+    if let Some(fragment_ids) = fragment_ids {
+        index_builder = index_builder.fragments(fragment_ids);
+    }
+
+    if let Some(index_uuid) = index_uuid {
+        index_builder = index_builder.index_uuid(index_uuid);
+    }
+
+    if let Some(reader) = batch_reader {
+        index_builder = index_builder.preprocessed_data(Box::new(reader));
+    }
+
+    if skip_commit {
+        RT.block_on(index_builder.execute_uncommitted())?;
+    } else {
+        RT.block_on(index_builder.into_future())?
+    }
 
     Ok(())
 }

@@ -38,8 +38,8 @@ pub struct CreateIndexBuilder<'a> {
     replace: bool,
     train: bool,
     fragments: Option<Vec<u32>>,
-    fragment_uuid: Option<String>,
-    stream: Option<Box<dyn RecordBatchReader + Send + 'static>>,
+    index_uuid: Option<String>,
+    preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -58,8 +58,8 @@ impl<'a> CreateIndexBuilder<'a> {
             replace: false,
             train: true,
             fragments: None,
-            fragment_uuid: None,
-            stream: None,
+            index_uuid: None,
+            preprocessed_data: None,
         }
     }
 
@@ -83,13 +83,16 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    pub fn fragment_uuid(mut self, uuid: String) -> Self {
-        self.fragment_uuid = Some(uuid);
+    pub fn index_uuid(mut self, uuid: String) -> Self {
+        self.index_uuid = Some(uuid);
         self
     }
 
-    pub fn stream(mut self, stream: Box<dyn RecordBatchReader + Send + 'static>) -> Self {
-        self.stream = Some(stream);
+    pub fn preprocessed_data(
+        mut self,
+        stream: Box<dyn RecordBatchReader + Send + 'static>,
+    ) -> Self {
+        self.preprocessed_data = Some(stream);
         self
     }
 
@@ -144,7 +147,7 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         }
 
-        let index_id = match &self.fragment_uuid {
+        let index_id = match &self.index_uuid {
             Some(uuid_str) => Uuid::parse_str(uuid_str).map_err(|e| Error::Index {
                 message: format!("Invalid UUID string provided: {}", e),
                 location: location!(),
@@ -162,7 +165,10 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
-                assert_eq!(self.index_type.eq(&IndexType::BTree), self.stream.is_some());
+                assert!(
+                    self.preprocessed_data.is_none() || self.index_type.eq(&IndexType::BTree),
+                    "Preprocessed data stream can only be provided for B-Tree index type at the moment."
+                );
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
@@ -185,8 +191,8 @@ impl<'a> CreateIndexBuilder<'a> {
                     base_params
                 };
 
-                let input_data = self
-                    .stream
+                let preprocesssed_data = self
+                    .preprocessed_data
                     .take()
                     .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
                 build_scalar_index(
@@ -196,7 +202,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     &params,
                     train,
                     self.fragments.clone(),
-                    input_data,
+                    preprocesssed_data,
                 )
                 .await?
             }

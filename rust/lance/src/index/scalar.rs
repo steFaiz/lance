@@ -274,7 +274,7 @@ pub(super) async fn build_scalar_index(
     params: &ScalarIndexParams,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
-    input_data: Option<SendableRecordBatchStream>,
+    preprocessed_data: Option<SendableRecordBatchStream>,
 ) -> Result<CreatedIndex> {
     let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
         source: format!("No column with name {}", column).into(),
@@ -288,7 +288,7 @@ pub(super) async fn build_scalar_index(
     let training_request =
         plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
-    let training_data = if input_data.is_none() {
+    let training_data = if preprocessed_data.is_none() {
         load_training_data(
             dataset,
             column,
@@ -299,7 +299,7 @@ pub(super) async fn build_scalar_index(
         )
         .await?
     } else {
-        input_data.unwrap()
+        preprocessed_data.unwrap()
     };
 
     plugin
