@@ -760,6 +760,100 @@ fn inner_create_index(
     Ok(())
 }
 
+<<<<<<< HEAD
+=======
+fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> bool {
+    match index_type {
+        IndexType::BTree => {
+            if let Some(params) = params_opt {
+                let btree_parameters = serde_json::from_str::<BTreeParameters>(params)
+                    .expect("Cannot deserialize BTreeParameters from input params.");
+                return btree_parameters.range_id.is_some();
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_innerMergeIndexMetadata<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject, // Optional<Integer>
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_merge_index_metadata(
+            &mut env,
+            java_dataset,
+            index_uuid,
+            index_type_code_jobj,
+            batch_readhead_jobj
+        )
+    );
+}
+
+fn inner_merge_index_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject, // Optional<Integer>
+) -> Result<()> {
+    let index_uuid = index_uuid.extract(env)?;
+    let index_type = IndexType::try_from(index_type_code_jobj)?;
+    let batch_readhead = env
+        .get_int_opt(&batch_readhead_jobj)?
+        .map(|val| val as usize);
+
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(async {
+        let index_store = LanceIndexStore::from_dataset_for_new(&dataset_guard.inner, &index_uuid)?;
+        let object_store = dataset_guard.inner.object_store();
+        let index_dir = dataset_guard.inner.indices_dir().child(index_uuid);
+
+        match index_type {
+            IndexType::Inverted => lance_index::scalar::inverted::builder::merge_index_files(
+                object_store,
+                &index_dir,
+                Arc::new(index_store),
+            )
+            .await
+            .map_err(|e| {
+                Error::runtime_error(format!(
+                    "Cannot create index of type: {:?}. Caused by: {:?}",
+                    index_type,
+                    e.to_string()
+                ))
+            }),
+            IndexType::BTree => lance_index::scalar::btree::merge_index_files(
+                object_store,
+                &index_dir,
+                Arc::new(index_store),
+                batch_readhead,
+            )
+            .await
+            .map_err(|e| {
+                Error::runtime_error(format!(
+                    "Cannot create index of type: {:?}. Caused by: {:?}",
+                    index_type,
+                    e.to_string()
+                ))
+            }),
+            _ => Err(Error::input_error(format!(
+                "Cannot merge index type: {:?}. Only supports BTREE and INVERTED now.",
+                index_type
+            ))),
+        }
+    })
+}
+
+>>>>>>> a1c529ad (PullRequest: 33 Refactor: Infer range_partitioned internally from range_id's presence)
 //////////////////
 // Read Methods //
 //////////////////

@@ -8393,7 +8393,6 @@ mod test {
         let params =
             ScalarIndexParams::new(IndexType::BTree.to_string()).with_params(&BTreeParameters {
                 zone_size: None,
-                range_partitioned: true,
                 range_id: Some(range_id),
             });
         let index_builder = dataset.create_index_builder(&["value"], IndexType::BTree, &params);

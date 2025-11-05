@@ -867,7 +867,6 @@ pub mod tests {
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
-            DEFAULT_RANGE_PARTITIONED,
             None,
         )
         .await
