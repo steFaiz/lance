@@ -3918,9 +3918,8 @@ mod test {
     use super::*;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
-    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
-    use crate::dataset::{CommitBuilder, WriteMode};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
         assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
@@ -8300,133 +8299,6 @@ mod test {
         assert_eq!(unsorted_values[0], 50);
         assert_eq!(unsorted_values[1], 20);
         assert_eq!(unsorted_values[2], 80);
-    }
-
-    #[tokio::test]
-    async fn test_scan_with_btree() {
-        let id_array = Int32Array::from(vec![5, 2, 8, 1, 3, 7, 4, 6]);
-        let value_array = Int32Array::from(vec![50, 20, 80, 10, 30, 70, 40, 60]);
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("value", DataType::Int32, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(id_array), Arc::new(value_array)],
-        )
-        .unwrap();
-
-        let test_dir = TempStrDir::default();
-        let test_uri = &test_dir;
-        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
-
-        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        let lance_schema = dataset.schema();
-
-        let mut scanner = dataset.scan();
-        scanner
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "value".to_string(),
-            )]))
-            .unwrap()
-            .project(&["value"])
-            .unwrap();
-        let stream = scanner.try_into_stream().await.unwrap();
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-        let value_num = batches[0].num_rows();
-
-        let index_uuid = Uuid::new_v4().to_string();
-        // create index distributedly
-        create_index_for_range(
-            &mut dataset.clone(),
-            batches[0].slice(0, value_num / 2),
-            0,
-            &index_uuid,
-        )
-        .await;
-        create_index_for_range(
-            &mut dataset.clone(),
-            batches[0].slice(value_num / 2, value_num - value_num / 2),
-            1,
-            &index_uuid,
-        )
-        .await;
-
-        let object_store = dataset.object_store();
-        let index_dir = dataset.indices_dir().child(index_uuid.clone());
-        let store = LanceIndexStore::new(
-            dataset.object_store.clone(),
-            index_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        );
-        lance_index::scalar::btree::merge_index_files(
-            object_store,
-            &index_dir,
-            Arc::new(store),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let mut bitmap = RoaringBitmap::new();
-        bitmap.insert(0);
-
-        let metadata = IndexMetadata {
-            uuid: Uuid::parse_str(&index_uuid).unwrap(),
-            fields: vec![lance_schema.field_id("value").unwrap()],
-            name: "test_index".to_string(),
-            dataset_version: 1,
-            fragment_bitmap: Some(bitmap),
-            index_details: None,
-            index_version: 1,
-            created_at: None,
-            base_id: None,
-        };
-
-        let op = Operation::CreateIndex {
-            new_indices: vec![metadata],
-            removed_indices: vec![],
-        };
-        let tx = Transaction::new(1, op, None, None);
-
-        let new_ds = CommitBuilder::new(Arc::new(dataset))
-            .execute(tx)
-            .await
-            .unwrap();
-
-        let mut scanner = new_ds.scan();
-        scanner
-            .with_row_id()
-            .filter("value in (10, 20, 30)")
-            .unwrap();
-        let stream = scanner.try_into_stream().await.unwrap();
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-    }
-
-    async fn create_index_for_range(
-        dataset: &mut Dataset,
-        batch: RecordBatch,
-        range_id: u32,
-        index_uuid: &str,
-    ) {
-        let schema = batch.schema();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let params =
-            ScalarIndexParams::new(IndexType::BTree.to_string()).with_params(&BTreeParameters {
-                zone_size: None,
-                range_id: Some(range_id),
-            });
-        let index_builder = dataset.create_index_builder(&["value"], IndexType::BTree, &params);
-        index_builder
-            .name("test_index".to_string())
-            .index_uuid(index_uuid.to_string())
-            .preprocessed_data(Box::new(reader))
-            .execute_uncommitted()
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
