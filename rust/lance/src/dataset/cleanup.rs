@@ -295,7 +295,7 @@ impl<'a> CleanupTask<'a> {
 
         let old_manifests_stream = stream::iter(old_manifests)
             .map(|path| {
-                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = path.as_ref());
                 Ok(path)
             })
             .boxed();
@@ -667,8 +667,8 @@ mod tests {
     impl WrappingObjectStore for MockObjectStore {
         fn wrap(
             &self,
+            _storage_prefix: &str,
             original: Arc<dyn object_store::ObjectStore>,
-            _storage_options: Option<&std::collections::HashMap<String, String>>,
         ) -> Arc<dyn object_store::ObjectStore> {
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
         }

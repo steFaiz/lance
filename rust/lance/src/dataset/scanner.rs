@@ -75,7 +75,7 @@ use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
-use crate::dataset::utils::wrap_json_stream_for_reading;
+use crate::dataset::utils::SchemaAdapter;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
@@ -430,10 +430,6 @@ pub struct Scanner {
     legacy_with_row_id: bool,
     /// Whether the user wants the row address on top of the projection, will always come last
     legacy_with_row_addr: bool,
-    /// Whether the user wants the row last updated at version column on top of the projection
-    legacy_with_row_last_updated_at_version: bool,
-    /// Whether the user wants the row created at version column on top of the projection
-    legacy_with_row_created_at_version: bool,
     /// Whether the user explicitly requested a projection.  If they did then we will warn them
     /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
     explicit_projection: bool,
@@ -629,8 +625,6 @@ impl Scanner {
             file_reader_options,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
-            legacy_with_row_last_updated_at_version: false,
-            legacy_with_row_created_at_version: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
         }
@@ -715,12 +709,6 @@ impl Scanner {
         }
         if self.legacy_with_row_addr {
             self.projection_plan.include_row_addr();
-        }
-        if self.legacy_with_row_last_updated_at_version {
-            self.projection_plan.include_row_last_updated_at_version();
-        }
-        if self.legacy_with_row_created_at_version {
-            self.projection_plan.include_row_created_at_version();
         }
         Ok(self)
     }
@@ -1092,6 +1080,21 @@ impl Scanner {
     ///
     /// This method is a convenience method that sets both [Self::minimum_nprobes] and
     /// [Self::maximum_nprobes] to the same value.
+    pub fn nprobes(&mut self, n: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.minimum_nprobes = n;
+            q.maximum_nprobes = Some(n);
+        } else {
+            log::warn!("nprobes is not set because nearest has not been called yet");
+        }
+        self
+    }
+
+    /// Configures how many partititions will be searched in the vector index.
+    ///
+    /// This method is a convenience method that sets both [Self::minimum_nprobes] and
+    /// [Self::maximum_nprobes] to the same value.
+    #[deprecated(note = "Use nprobes instead")]
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.minimum_nprobes = n;
@@ -1226,24 +1229,6 @@ impl Scanner {
     pub fn with_row_address(&mut self) -> &mut Self {
         self.legacy_with_row_addr = true;
         self.projection_plan.include_row_addr();
-        self
-    }
-
-    /// Instruct the scanner to return row last updated at version column from the dataset.
-    ///
-    /// This adds `_row_last_updated_at_version` column which is materialized from fragment metadata.
-    pub fn with_row_last_updated_at_version(&mut self) -> &mut Self {
-        self.legacy_with_row_last_updated_at_version = true;
-        self.projection_plan.include_row_last_updated_at_version();
-        self
-    }
-
-    /// Instruct the scanner to return row created at version column from the dataset.
-    ///
-    /// This adds `_row_created_at_version` column which is materialized from fragment metadata.
-    pub fn with_row_created_at_version(&mut self) -> &mut Self {
-        self.legacy_with_row_created_at_version = true;
-        self.projection_plan.include_row_created_at_version();
         self
     }
 
@@ -1443,28 +1428,6 @@ impl Scanner {
             }
         }
 
-        if self.legacy_with_row_last_updated_at_version
-            && !output_expr
-                .iter()
-                .any(|(_, name)| name == lance_core::ROW_LAST_UPDATED_AT_VERSION)
-        {
-            return Err(Error::Internal {
-                message: "user specified with_row_last_updated_at_version but the column was not in the output".to_string(),
-                location: location!(),
-            });
-        }
-
-        if self.legacy_with_row_created_at_version
-            && !output_expr
-                .iter()
-                .any(|(_, name)| name == lance_core::ROW_CREATED_AT_VERSION)
-        {
-            return Err(Error::Internal {
-                message: "user specified with_row_created_at_version but the column was not in the output".to_string(),
-                location: location!(),
-            });
-        }
-
         Ok(output_expr)
     }
 
@@ -1658,12 +1621,6 @@ impl Scanner {
             .empty_projection()
             .union_columns(filter_columns, OnMissing::Error)?
             .into_schema();
-        if filter_schema.fields.iter().any(|f| !f.is_default_storage()) {
-            return Err(Error::NotSupported {
-                source: "non-default storage columns cannot be used as filters".into(),
-                location: location!(),
-            });
-        }
 
         // Start with the desired fields
         Ok(desired_projection
@@ -1936,7 +1893,7 @@ impl Scanner {
         // Stage 5: take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
-        // Stage 6: if requested, add the row offset column
+        // Stage 6: Add system columns, if requested
         if self.projection_plan.must_add_row_offset {
             plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
         }
@@ -2106,6 +2063,10 @@ impl Scanner {
 
         if make_deletions_null {
             read_options = read_options.with_deleted_rows()?;
+        }
+
+        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
         }
 
         let index_input = filter_plan.index_query.clone().map(|index_query| {
@@ -3699,10 +3660,13 @@ pub struct DatasetRecordBatchStream {
 
 impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
-        // Convert lance.json (JSONB) back to arrow.json (strings) for reading
-        //
-        // This is so bad, we need to find a way to remove this.
-        let exec_node = wrap_json_stream_for_reading(exec_node);
+        let schema = exec_node.schema();
+        let adapter = SchemaAdapter::new(schema.clone());
+        let exec_node = if SchemaAdapter::requires_logical_conversion(&schema) {
+            adapter.to_logical_stream(exec_node)
+        } else {
+            exec_node
+        };
 
         let span = info_span!("DatasetRecordBatchStream");
         Self { exec_node, span }
@@ -3916,7 +3880,7 @@ mod test {
     use std::vec;
 
     use arrow::array::as_primitive_array;
-    use arrow::datatypes::{Int32Type, Int64Type};
+    use arrow::datatypes::{Float64Type, Int32Type, Int64Type};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
@@ -3931,10 +3895,12 @@ mod test {
     use half::f16;
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
     use lance_datagen::{
         array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount,
     };
     use lance_file::version::LanceFileVersion;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -4867,6 +4833,61 @@ mod test {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_wildcard() {
+        let data = gen_batch()
+            .col("x", array::step::<Float64Type>())
+            .col("y", array::step::<Float64Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let check_cols = async |projection: &[&str], expected_cols: &[&str]| {
+            let mut scan = data.scan();
+            scan.project(projection).unwrap();
+            let stream = scan.try_into_stream().await.unwrap();
+            let schema = stream.schema();
+            let field_names = schema.field_names();
+            assert_eq!(field_names, expected_cols);
+        };
+
+        check_cols(&["*"], &["x", "y"]).await;
+        check_cols(&["x", "y"], &["x", "y"]).await;
+        check_cols(&["x"], &["x"]).await;
+        check_cols(&["_rowid", "*"], &["_rowid", "x", "y"]).await;
+        check_cols(&["*", "_rowid"], &["x", "y", "_rowid"]).await;
+        check_cols(
+            &["_rowid", "*", "_rowoffset"],
+            &["_rowid", "x", "y", "_rowoffset"],
+        )
+        .await;
+
+        let check_exprs = async |exprs: &[&str], expected_cols: &[&str]| {
+            let mut scan = data.scan();
+            let projection = exprs
+                .iter()
+                .map(|e| (e.to_string(), e.to_string()))
+                .collect::<Vec<_>>();
+            scan.project_with_transform(&projection).unwrap();
+            let stream = scan.try_into_stream().await.unwrap();
+            let schema = stream.schema();
+            let field_names = schema.field_names();
+            assert_eq!(field_names, expected_cols);
+        };
+
+        // Make sure we can reference * fields in exprs and add new columns
+        check_exprs(&["_rowid", "*", "x * 2"], &["_rowid", "x", "y", "x * 2"]).await;
+
+        let check_fails = |projection: &[&str]| {
+            let mut scan = data.scan();
+            assert!(scan.project(projection).is_err());
+        };
+
+        // Would duplicate x
+        check_fails(&["x", "*"]);
+        check_fails(&["_rowid", "_rowid"]);
     }
 
     #[rstest]
@@ -5871,7 +5892,10 @@ mod test {
 
             // UPDATE
 
-            dataset.optimize_indices(&Default::default()).await.unwrap();
+            dataset
+                .optimize_indices(&OptimizeOptions::merge(1))
+                .await
+                .unwrap();
             let updated_version = dataset.version().version;
 
             // APPEND -> DELETE
@@ -7338,7 +7362,7 @@ mod test {
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello"#;
+      MatchQuery: column=s, query=hello"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7354,7 +7378,7 @@ mod test {
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      PhraseQuery: query=hello world"#;
+      PhraseQuery: column=s, query=hello world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7372,8 +7396,8 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
-        MatchQuery: query=hello
-        MatchQuery: query=world"#;
+        MatchQuery: column=s, query=hello
+        MatchQuery: column=s, query=world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -7395,7 +7419,7 @@ mod test {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello
+      MatchQuery: column=s, query=hello
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             MaterializeIndex: query=[i > 10]@i_idx
@@ -7406,7 +7430,7 @@ mod test {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello
+      MatchQuery: column=s, query=hello
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
           ScalarIndexQuery: query=[i > 10]@i_idx"#
         };
@@ -7430,8 +7454,8 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
-            FlatMatchQuery: query=hello
+            MatchQuery: column=s, query=hello
+            FlatMatchQuery: column=s, query=hello
               LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#;
         dataset.append_new_data().await?;
         assert_plan_equals(
@@ -7453,14 +7477,14 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
+            MatchQuery: column=s, query=hello
               RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                 UnionExec
                   MaterializeIndex: query=[i > 10]@i_idx
                   ProjectionExec: expr=[_rowid@1 as _rowid]
                     FilterExec: i@0 > 10
                       LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
-            FlatMatchQuery: query=hello
+            FlatMatchQuery: column=s, query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
@@ -7470,10 +7494,10 @@ mod test {
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MatchQuery: query=hello
+            MatchQuery: column=s, query=hello
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
                 ScalarIndexQuery: query=[i > 10]@i_idx
-            FlatMatchQuery: query=hello
+            FlatMatchQuery: column=s, query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
         };
@@ -8437,9 +8461,10 @@ mod test {
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         let mut scanner = dataset.scan();
+
         scanner
-            .with_row_last_updated_at_version()
-            .with_row_created_at_version();
+            .project(&[ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
+            .unwrap();
 
         // Check that the schema includes version columns
         let output_schema = scanner.schema().await.unwrap();
@@ -8498,5 +8523,54 @@ mod test {
                 "All rows created at version 1"
             );
         }
+    }
+
+    #[test_log::test(test)]
+    fn test_scan_finishes_all_tasks() {
+        // Need to use multi-threaded runtime otherwise tasks don't run unless someone is polling somewhere
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let ds = lance_datagen::gen_batch()
+                .col("id", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1000), FragmentRowCount::from(10))
+                .await
+                .unwrap();
+
+            // This scan with has a small I/O buffer size and batch size to mimic a real-world situation
+            // that required a lot of data.  Many fragments will be scheduled at low priority and the data
+            // buffer will fill up with data reads.  When the scan is abandoned, the tasks to read the fragment
+            // metadata were left behind and would never finish because the data was never decoded to drain the
+            // backpressure queue.
+            //
+            // The fix (that this test verifies) is to ensure we close the I/O scheduler when the scan is abandoned.
+            let mut stream = ds
+                .scan()
+                .fragment_readahead(1000)
+                .batch_size(1)
+                .io_buffer_size(1)
+                .batch_readahead(1)
+                .try_into_stream()
+                .await
+                .unwrap();
+            stream.next().await.unwrap().unwrap();
+        });
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if runtime.handle().metrics().num_alive_tasks() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        assert!(
+            runtime.handle().metrics().num_alive_tasks() == 0,
+            "Tasks should have finished within 10 seconds but there are still {} tasks running",
+            runtime.handle().metrics().num_alive_tasks()
+        );
     }
 }

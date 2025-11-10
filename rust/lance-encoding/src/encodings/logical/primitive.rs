@@ -130,7 +130,7 @@ struct ChunkMeta {
 }
 
 /// A mini-block chunk that has been decoded and decompressed
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DecodedMiniBlockChunk {
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
@@ -530,13 +530,42 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         // We need to keep track of the offset into repbuf/defbuf that we are building up
         let mut level_offset = 0;
-        // Now we iterate through each instruction and process it
-        for (instructions, chunk) in self.instructions.iter() {
-            // TODO: It's very possible that we have duplicate `buf` in self.instructions and we
-            // don't want to decode the buf again and again on the same thread.
 
-            let DecodedMiniBlockChunk { rep, def, values } =
-                self.decode_miniblock_chunk(&chunk.data, chunk.items_in_chunk)?;
+        // Pre-compute caching needs for each chunk by checking if the next chunk is the same
+        let needs_caching: Vec<bool> = self
+            .instructions
+            .windows(2)
+            .map(|w| w[0].1.chunk_idx == w[1].1.chunk_idx)
+            .chain(std::iter::once(false)) // the last one never needs caching
+            .collect();
+
+        // Cache for storing decoded chunks when beneficial
+        let mut chunk_cache: Option<(usize, DecodedMiniBlockChunk)> = None;
+
+        // Now we iterate through each instruction and process it
+        for (idx, (instructions, chunk)) in self.instructions.iter().enumerate() {
+            let should_cache_this_chunk = needs_caching[idx];
+
+            let decoded_chunk = match &chunk_cache {
+                Some((cached_chunk_idx, ref cached_chunk))
+                    if *cached_chunk_idx == chunk.chunk_idx =>
+                {
+                    // Clone only when we have a cache hit (much cheaper than decoding)
+                    cached_chunk.clone()
+                }
+                _ => {
+                    // Cache miss, need to decode
+                    let decoded = self.decode_miniblock_chunk(&chunk.data, chunk.items_in_chunk)?;
+
+                    // Only update cache if this chunk will benefit the next access
+                    if should_cache_this_chunk {
+                        chunk_cache = Some((chunk.chunk_idx, decoded.clone()));
+                    }
+                    decoded
+                }
+            };
+
+            let DecodedMiniBlockChunk { rep, def, values } = decoded_chunk;
 
             // Our instructions tell us which rows we want to take from this chunk
             let row_range_start =
@@ -572,7 +601,8 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         let mut data = data_builder.finish();
 
-        let unraveler = RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone());
+        let unraveler =
+            RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone(), data.num_values());
 
         if let Some(dictionary) = &self.dictionary_data {
             // Don't decode here, that happens later (if needed)
@@ -922,7 +952,7 @@ impl DecodePageTask for DecodeComplexAllNullTask {
         };
 
         let data = DataBlock::AllNull(AllNullDataBlock { num_values });
-        let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning);
+        let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning, num_values);
         Ok(DecodedPage {
             data,
             repdef: unraveler,
@@ -975,6 +1005,7 @@ impl DecodePageTask for SimpleAllNullDecodePageTask {
             None,
             Some(vec![1; self.num_values as usize]),
             Arc::new([DefinitionInterpretation::NullableItem]),
+            self.num_values,
         );
         Ok(DecodedPage {
             data: DataBlock::AllNull(AllNullDataBlock {
@@ -2649,7 +2680,12 @@ impl DecodePageTask for VariableFullZipDecodeTask {
         } else {
             Some(self.def.to_vec())
         };
-        let unraveler = RepDefUnraveler::new(rep, def, self.details.def_meaning.clone());
+        let unraveler = RepDefUnraveler::new(
+            rep,
+            def,
+            self.details.def_meaning.clone(),
+            self.num_visible_items,
+        );
         Ok(DecodedPage {
             data: decomopressed,
             repdef: unraveler,
@@ -2702,7 +2738,12 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 data_builder.append(&decompressed, 0..task_item.rows_in_buf);
             }
 
-            let unraveler = RepDefUnraveler::new(None, None, self.details.def_meaning.clone());
+            let unraveler = RepDefUnraveler::new(
+                None,
+                None,
+                self.details.def_meaning.clone(),
+                self.num_rows as u64,
+            );
 
             Ok(DecodedPage {
                 data: data_builder.finish(),
@@ -2764,8 +2805,12 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             let repetition = if rep.is_empty() { None } else { Some(rep) };
             let definition = if def.is_empty() { None } else { Some(def) };
 
-            let unraveler =
-                RepDefUnraveler::new(repetition, definition, self.details.def_meaning.clone());
+            let unraveler = RepDefUnraveler::new(
+                repetition,
+                definition,
+                self.details.def_meaning.clone(),
+                self.num_rows as u64,
+            );
             let data = data_builder.finish();
 
             Ok(DecodedPage {

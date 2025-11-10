@@ -93,7 +93,6 @@ impl<'a> CreateIndexBuilder<'a> {
         stream: Box<dyn RecordBatchReader + Send + 'static>,
     ) -> Self {
         self.preprocessed_data = Some(stream);
-        self
     }
 
     #[instrument(skip_all)]
@@ -377,7 +376,6 @@ impl<'a> CreateIndexBuilder<'a> {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
-            /*blobs_op= */ None,
             None,
         );
 
@@ -557,7 +555,7 @@ mod tests {
                 CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
                     .name("distributed_index".to_string())
                     .fragments(vec![fragment_id])
-                    .fragment_uuid(shared_uuid.clone());
+                    .index_uuid(shared_uuid.clone());
 
             let index_metadata = builder.execute_uncommitted().await.unwrap();
 
