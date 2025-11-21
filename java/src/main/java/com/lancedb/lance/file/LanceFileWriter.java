@@ -121,6 +121,19 @@ public class LanceFileWriter implements AutoCloseable {
   }
 
   /**
+   * Write a schema metadata map to underlying file. User can retrieve those values from {@link
+   * LanceFileReader#schema() reader schema}.
+   *
+   * @param metadata metadata
+   * @throws IOException IOException
+   */
+  public void writeSchemaMetadata(Map<String, String> metadata) throws IOException {
+    nativeWriteSchemaMetadata(metadata);
+  }
+
+  private native void nativeWriteSchemaMetadata(Map<String, String> metadata) throws IOException;
+
+  /**
    * Close the LanceFileWriter
    *
    * <p>This method must be called to release resources when the writer is no longer needed.

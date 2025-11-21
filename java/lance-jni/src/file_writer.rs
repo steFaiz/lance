@@ -150,6 +150,37 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_closeNative<'
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_nativeWriteSchemaMetadata<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    writer: JObject,
+    schema_metadata: JObject, // Map<String, String>
+) -> JObject<'local> {
+    if let Err(e) = inner_write_schema_metadata(&mut env, writer, schema_metadata) {
+        e.throw(&mut env);
+        return JObject::null();
+    }
+    JObject::null()
+}
+
+fn inner_write_schema_metadata(
+    env: &mut JNIEnv<'_>,
+    writer: JObject,
+    schema_metadata: JObject, // Map<String, String>
+) -> Result<()> {
+    let metadata_map = JMap::from_env(env, &schema_metadata)?;
+    let metadata = to_rust_map(env, &metadata_map)?;
+    let writer_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingFileWriter>(writer, NATIVE_WRITER) }?;
+    let mut writer = writer_guard.inner.lock().unwrap();
+    metadata.into_iter().for_each(|(k, v)| {
+        writer.add_schema_metadata(k, v);
+    });
+    Ok(())
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_writeNative<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,
